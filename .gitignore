@@ -1,0 +1,14 @@
+/target/
+/.minseo/
+/.claw/
+/.claude/
+**/.minseo/
+**/.claw/
+**/.claude/
+/.agents/
+/.clawd-agents/
+/.sandbox-home/
+/.sandbox-tmp/
+/nul
+/ownership_examples
+*.legacy_backup
