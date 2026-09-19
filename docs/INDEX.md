@@ -6,7 +6,9 @@ the existing inline REPL and one-shot CLI: normal terminal scrollback,
 
 ## Start here
 
-- [CLI roadmap](planning/CLI-ROADMAP.md) — the active, source-audited plan.
+- [Oog Code direction](OOG_CODE_DIRECTION.md) — the product brief and boundaries.
+- [Oog Code implementation plan](planning/OOG_CODE_IMPLEMENTATION_PLAN.md) — the active delivery plan.
+- [CLI roadmap](planning/CLI-ROADMAP.md) — older terminal-first baseline and reliability notes.
 - [Architecture](architecture/ARCHITECTURE.md) — what is actually wired today.
 - [Features](reference/FEATURES.md) — implemented tool and command surface.
 - [Parity](reference/PARITY.md) — upstream-compatibility work and known gaps.
