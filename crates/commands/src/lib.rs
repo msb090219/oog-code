@@ -58,9 +58,9 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
-        name: "status",
-        aliases: &[],
-        summary: "Show current session status",
+        name: "see",
+        aliases: &["status"],
+        summary: "Show session, workspace, and active context",
         argument_hint: None,
         resume_supported: true,
     },
@@ -79,11 +79,18 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
-        name: "compact",
-        aliases: &[],
+        name: "smash",
+        aliases: &["compact"],
         summary: "Compact local session history",
         argument_hint: None,
         resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "small",
+        aliases: &[],
+        summary: "Show token and context usage",
+        argument_hint: None,
+        resume_supported: false,
     },
     SlashCommandSpec {
         name: "model",
@@ -417,9 +424,9 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
-        name: "exit",
-        aliases: &["quit"],
-        summary: "Exit the REPL session",
+        name: "quit",
+        aliases: &["exit"],
+        summary: "Exit Oog",
         argument_hint: None,
         resume_supported: false,
     },
@@ -1099,6 +1106,7 @@ pub enum SlashCommand {
         confirm: bool,
     },
     Cost,
+    Small,
     Resume {
         session_path: Option<String>,
     },
@@ -1265,7 +1273,7 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Help
         }
-        "status" => {
+        "status" | "see" => {
             validate_no_args(command, &args)?;
             SlashCommand::Status
         }
@@ -1277,7 +1285,7 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Sandbox
         }
-        "compact" => {
+        "compact" | "smash" => {
             validate_no_args(command, &args)?;
             SlashCommand::Compact
         }
@@ -1311,6 +1319,10 @@ pub fn validate_slash_command_input(
         "cost" => {
             validate_no_args(command, &args)?;
             SlashCommand::Cost
+        }
+        "small" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Small
         }
         "resume" => SlashCommand::Resume {
             session_path: Some(require_remainder(command, remainder, "<session-path>")?),
@@ -1953,7 +1965,7 @@ pub fn suggest_slash_commands(input: &str, limit: usize) -> Vec<String> {
 pub fn render_slash_command_help() -> String {
     let mut lines = vec![
         "Slash commands".to_string(),
-        "  Start here        /status, /diff, /agents, /skills, /commit".to_string(),
+        "  Start here        /see, /smash, /session, /cost".to_string(),
         "  [resume]          also works with --resume SESSION.jsonl".to_string(),
         String::new(),
     ];
@@ -3251,6 +3263,7 @@ pub fn handle_slash_command(
         | SlashCommand::Permissions { .. }
         | SlashCommand::Clear { .. }
         | SlashCommand::Cost
+        | SlashCommand::Small
         | SlashCommand::Resume { .. }
         | SlashCommand::Config { .. }
         | SlashCommand::Mcp { .. }
@@ -3412,6 +3425,12 @@ mod tests {
             SlashCommand::parse(" /status "),
             Ok(Some(SlashCommand::Status))
         );
+        assert_eq!(SlashCommand::parse("/see"), Ok(Some(SlashCommand::Status)));
+        assert_eq!(
+            SlashCommand::parse("/smash"),
+            Ok(Some(SlashCommand::Compact))
+        );
+        assert_eq!(SlashCommand::parse("/small"), Ok(Some(SlashCommand::Small)));
         assert_eq!(
             SlashCommand::parse("/project"),
             Ok(Some(SlashCommand::Project))
@@ -3728,17 +3747,17 @@ mod tests {
     #[test]
     fn renders_help_from_shared_specs() {
         let help = render_slash_command_help();
-        assert!(help.contains("Start here        /status, /diff, /agents, /skills, /commit"));
+        assert!(help.contains("Start here        /see, /smash, /session, /cost"));
         assert!(help.contains("[resume]          also works with --resume SESSION.jsonl"));
         assert!(help.contains("Session & visibility"));
         assert!(help.contains("Workspace & git"));
         assert!(help.contains("Discovery & debugging"));
         assert!(help.contains("Analysis & automation"));
         assert!(help.contains("/help"));
-        assert!(help.contains("/status"));
+        assert!(help.contains("/see"));
         assert!(help.contains("/project"));
         assert!(help.contains("/sandbox"));
-        assert!(help.contains("/compact"));
+        assert!(help.contains("/smash"));
         assert!(help.contains("/bughunter [scope]"));
         assert!(help.contains("/commit"));
         assert!(help.contains("/pr [context]"));
@@ -3768,7 +3787,7 @@ mod tests {
         assert!(help.contains("aliases: /plugins, /marketplace"));
         assert!(help.contains("/agents [list|help]"));
         assert!(help.contains("/skills [list|install <path>|help]"));
-        assert_eq!(slash_command_specs().len(), 144);
+        assert_eq!(slash_command_specs().len(), 145);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
@@ -3821,7 +3840,7 @@ mod tests {
     fn suggests_closest_slash_commands_for_typos_and_aliases() {
         let suggestions = suggest_slash_commands("stats", 3);
         assert!(suggestions.contains(&"/stats".to_string()));
-        assert!(suggestions.contains(&"/status".to_string()));
+        assert!(suggestions.contains(&"/see".to_string()));
         assert!(suggestions.len() <= 3);
         let plugin_suggestions = suggest_slash_commands("/plugns", 3);
         assert!(plugin_suggestions.contains(&"/plugin".to_string()));

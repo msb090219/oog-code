@@ -17,9 +17,7 @@ use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
-const MAX_TOOL_RESULT_CHARS: usize = 16_000;
-const TOOL_RESULT_HEAD_CHARS: usize = 12_000;
-const TOOL_RESULT_TAIL_CHARS: usize = 3_000;
+const MAX_BASH_RESULT_CHARS: usize = 4_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
@@ -289,6 +287,41 @@ where
         }
     }
 
+    fn compact_bash_result(
+        &self,
+        tool_use_id: &str,
+        tool_name: &str,
+        output: &str,
+        is_error: bool,
+    ) -> String {
+        if tool_name != "bash" || output.chars().count() <= MAX_BASH_RESULT_CHARS {
+            return output.to_string();
+        }
+
+        let Some(session_path) = self.session.persistence_path() else {
+            return output.to_string();
+        };
+        let artifact_dir = session_path.with_extension("tool-output");
+        let artifact_name = tool_use_id
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let artifact_path = artifact_dir.join(format!("{artifact_name}.txt"));
+        if std::fs::create_dir_all(&artifact_dir).is_err()
+            || std::fs::write(&artifact_path, output).is_err()
+        {
+            return output.to_string();
+        }
+
+        compact_bash_output(output, &artifact_path.display().to_string(), is_error)
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn run_turn(
         &mut self,
@@ -448,18 +481,15 @@ where
                                 || post_hook_result.is_failed()
                                 || post_hook_result.is_cancelled(),
                         );
-                        output = bound_tool_result(output);
+                        output =
+                            self.compact_bash_result(&tool_use_id, &tool_name, &output, is_error);
 
                         ConversationMessage::tool_result(tool_use_id, tool_name, output, is_error)
                     }
                     PermissionOutcome::Deny { reason } => ConversationMessage::tool_result(
                         tool_use_id,
                         tool_name,
-                        bound_tool_result(merge_hook_feedback(
-                            pre_hook_result.messages(),
-                            reason,
-                            true,
-                        )),
+                        merge_hook_feedback(pre_hook_result.messages(), reason, true),
                         true,
                     ),
                 };
@@ -749,23 +779,25 @@ fn merge_hook_feedback(messages: &[String], output: String, is_error: bool) -> S
     sections.join("\n\n")
 }
 
-fn bound_tool_result(output: String) -> String {
+fn compact_bash_output(output: &str, artifact_path: &str, is_error: bool) -> String {
     let total_chars = output.chars().count();
-    if total_chars <= MAX_TOOL_RESULT_CHARS {
-        return output;
-    }
+    let notice = format!(
+        "[Oog saved full bash output: {total_chars} characters at {artifact_path}. Read that file to inspect more.]"
+    );
+    let available = MAX_BASH_RESULT_CHARS.saturating_sub(notice.chars().count() + 4);
+    let tail_chars = if is_error {
+        available.saturating_mul(3) / 4
+    } else {
+        available / 3
+    };
+    let head_chars = available.saturating_sub(tail_chars);
 
-    let head = output
-        .chars()
-        .take(TOOL_RESULT_HEAD_CHARS)
-        .collect::<String>();
+    let head = output.chars().take(head_chars).collect::<String>();
     let tail = output
         .chars()
-        .skip(total_chars.saturating_sub(TOOL_RESULT_TAIL_CHARS))
+        .skip(total_chars.saturating_sub(tail_chars))
         .collect::<String>();
-    format!(
-        "{head}\n\n[Tool output truncated: {total_chars} characters total. Use a narrower command, offset, or limit to inspect more.]\n\n{tail}"
-    )
+    format!("{head}\n\n{notice}\n\n{tail}")
 }
 
 type ToolHandler = Box<dyn FnMut(&str) -> Result<String, ToolError>>;
@@ -803,10 +835,9 @@ impl ToolExecutor for StaticToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::{
-        bound_tool_result, build_assistant_message, parse_auto_compaction_threshold, ApiClient,
-        ApiRequest, AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent,
-        RuntimeError, StaticToolExecutor, ToolExecutor,
-        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD, MAX_TOOL_RESULT_CHARS,
+        build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
+        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
+        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -894,14 +925,31 @@ mod tests {
     }
 
     #[test]
-    fn bounds_large_tool_results_without_losing_the_end() {
-        let output = format!("start{}end", "x".repeat(MAX_TOOL_RESULT_CHARS));
-        let bounded = bound_tool_result(output);
+    fn saves_large_bash_output_and_keeps_a_compact_retrieval_handle() {
+        let path = temp_session_path("tool-output");
+        let session = Session::new().with_persistence_path(path.clone());
+        let runtime = ConversationRuntime::new(
+            session,
+            ScriptedApiClient { call_count: 0 },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+        let output = format!("start{}stack trace tail", "x".repeat(5_000));
 
-        assert!(bounded.contains("start"));
-        assert!(bounded.contains("end"));
-        assert!(bounded.contains("Tool output truncated"));
-        assert!(bounded.chars().count() <= MAX_TOOL_RESULT_CHARS);
+        let compact = runtime.compact_bash_result("tool:1", "bash", &output, true);
+        let artifact = path.with_extension("tool-output").join("tool_1.txt");
+
+        assert_eq!(
+            fs::read_to_string(&artifact).expect("artifact should persist"),
+            output
+        );
+        assert!(compact.contains("start"));
+        assert!(compact.contains("stack trace tail"));
+        assert!(compact.contains("Oog saved full bash output"));
+        assert!(compact.chars().count() <= 4_000);
+
+        fs::remove_dir_all(path.with_extension("tool-output")).expect("cleanup artifact");
     }
 
     #[test]

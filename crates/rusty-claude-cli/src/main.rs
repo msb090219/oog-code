@@ -510,9 +510,10 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
     ) {
         return None;
     }
-    let slash_command = slash_command_specs()
-        .iter()
-        .find(|spec| spec.name == command_name && is_live_slash_command(spec.name))?;
+    let slash_command = slash_command_specs().iter().find(|spec| {
+        is_live_slash_command(spec.name)
+            && (spec.name == command_name || spec.aliases.contains(&command_name))
+    })?;
     let guidance = if slash_command.resume_supported {
         format!(
             "`oog {command_name}` is a slash command. Use `oog --resume SESSION.jsonl /{command_name}` or start `oog` and run `/{command_name}`."
@@ -612,6 +613,22 @@ fn theme_muted_ansi() -> String {
     )
 }
 
+fn theme_success_ansi() -> String {
+    color_to_ansi(
+        theme::Theme::new(theme::ThemePreset::Default)
+            .semantic
+            .success,
+    )
+}
+
+fn theme_error_ansi() -> String {
+    color_to_ansi(
+        theme::Theme::new(theme::ThemePreset::Default)
+            .semantic
+            .error,
+    )
+}
+
 fn render_turn_body(content: &str) {
     let body_width = terminal_width().saturating_sub(2).max(20);
     for line in content.lines() {
@@ -628,29 +645,40 @@ fn render_turn_body(content: &str) {
     }
 }
 
-fn indent_output_chunk(chunk: &str, at_line_start: &mut bool) -> String {
-    let mut output = String::with_capacity(chunk.len());
-    for ch in chunk.chars() {
-        output.push(ch);
-        *at_line_start = ch != '\n';
-    }
-    output
+fn indent_output_chunk(chunk: &str, trailing_newlines: &mut usize) -> String {
+    *trailing_newlines = chunk
+        .chars()
+        .rev()
+        .take_while(|character| *character == '\n')
+        .count()
+        .min(2);
+    chunk.to_string()
+}
+
+fn render_section_divider(label: &str) -> String {
+    let label = format!("─ {label} ");
+    let rule = "─".repeat(
+        terminal_width()
+            .min(100)
+            .saturating_sub(label.chars().count())
+            .max(1),
+    );
+    format!("{}{}{}\x1b[0m", theme_muted_ansi(), label, rule)
+}
+
+fn render_section_start(label: &str, trailing_newlines: &mut usize) -> String {
+    let spacing = "\n".repeat(2usize.saturating_sub(*trailing_newlines));
+    *trailing_newlines = 1;
+    format!("{spacing}{}\n", render_section_divider(label))
 }
 
 fn render_input_prompt() -> String {
-    "> ".to_string()
-}
-
-fn render_input_footer(model: &str, permission_mode: PermissionMode) -> String {
-    format!(
-        "{model}  ·  {}  ·  /help for commands  ·  Ctrl+C to exit",
-        permission_mode.as_str()
-    )
+    " oog ‣ ".to_string()
 }
 
 fn render_user_message(content: &str) {
-    let width = terminal_width().max(20);
-    let body_width = width.saturating_sub(3).max(20);
+    let width = terminal_width().max(24);
+    let body_width = width.saturating_sub(8).max(10);
     let mut lines = Vec::new();
 
     for paragraph in content.lines() {
@@ -668,15 +696,17 @@ fn render_user_message(content: &str) {
         lines.push(String::new());
     }
 
+    let background = "\x1b[48;5;238m\x1b[97m";
     let empty_row = " ".repeat(width);
-    println!("\x1b[48;5;240m{empty_row}\x1b[0m");
+    println!();
+    println!("{background}{empty_row}\x1b[0m");
     for (index, line) in lines.iter().enumerate() {
-        let prefix = if index == 0 { "› " } else { "  " };
-        let row = format!("{prefix}{line}");
-        let padding = " ".repeat(width.saturating_sub(row.chars().count()));
-        println!("\x1b[48;5;240m\x1b[97m{row}{padding}\x1b[0m");
+        let prefix = if index == 0 { " user ‣ " } else { "        " };
+        let padding =
+            " ".repeat(width.saturating_sub(prefix.chars().count() + line.chars().count()));
+        println!("{background}{prefix}{line}{padding}\x1b[0m");
     }
-    println!("\x1b[48;5;240m{empty_row}\x1b[0m");
+    println!("{background}{empty_row}\x1b[0m");
     println!();
 }
 
@@ -686,12 +716,8 @@ fn render_assistant_header() {
 }
 
 fn render_turn_divider(elapsed: Duration) {
-    let elapsed = if elapsed.as_secs() == 0 {
-        format!("{}ms", elapsed.as_millis())
-    } else {
-        format!("{}s", elapsed.as_secs())
-    };
-    let label = format!("─ Worked for {elapsed} ");
+    let elapsed = format_elapsed(elapsed);
+    let label = format!("─ carved in {elapsed} ");
     let rule = "─".repeat(
         terminal_width()
             .saturating_sub(label.chars().count())
@@ -699,6 +725,109 @@ fn render_turn_divider(elapsed: Duration) {
     );
     println!("{}{}{}\x1b[0m", theme_muted_ansi(), label, rule);
     println!();
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    if elapsed.as_secs() == 0 {
+        format!("{}ms", elapsed.as_millis())
+    } else {
+        format!("{}s", elapsed.as_secs())
+    }
+}
+
+fn format_turn_result(
+    summary: &runtime::TurnSummary,
+    elapsed: Duration,
+    model: &str,
+) -> Option<String> {
+    let tool_uses = summary
+        .assistant_messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { name, input, .. } => Some((name.as_str(), input.as_str())),
+            ContentBlock::Text { .. } | ContentBlock::ToolResult { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    if tool_uses.is_empty() {
+        return None;
+    }
+
+    let changed_files = tool_uses
+        .iter()
+        .filter(|(name, _)| matches!(*name, "write_file" | "Write" | "edit_file" | "Edit"))
+        .map(|(_, input)| {
+            let parsed = serde_json::from_str(input)
+                .unwrap_or_else(|_| serde_json::Value::String((*input).to_string()));
+            extract_tool_path(&parsed)
+        })
+        .collect::<BTreeSet<_>>();
+    let test_commands = tool_uses
+        .iter()
+        .filter(|(name, input)| {
+            matches!(*name, "bash" | "Bash")
+                && serde_json::from_str::<serde_json::Value>(input)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .is_some_and(|command| command.contains("test"))
+        })
+        .count();
+    let tests_failed = summary
+        .tool_results
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .any(|block| match block {
+            ContentBlock::ToolResult {
+                tool_name,
+                output,
+                is_error,
+                ..
+            } if matches!(tool_name.as_str(), "bash" | "Bash") => {
+                *is_error || bash_exit_code(output).is_some_and(|code| code != 0)
+            }
+            ContentBlock::Text { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. } => false,
+        });
+    let pricing = pricing_for_model(model).unwrap_or_else(ModelPricing::default_sonnet_tier);
+    let mut details = vec![format!("{} tools", tool_uses.len())];
+    if !changed_files.is_empty() {
+        details.push(format!(
+            "carved {}",
+            changed_files.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if test_commands > 0 {
+        details.push(format!(
+            "tests {}",
+            if tests_failed { "failed" } else { "passed" }
+        ));
+    }
+    details.push(format_elapsed(elapsed));
+    details.push(format!(
+        "{} in / {} out",
+        summary.usage.input_tokens, summary.usage.output_tokens
+    ));
+    details.push(format_usd(
+        summary
+            .usage
+            .estimate_cost_usd_with_pricing(pricing)
+            .total_cost_usd(),
+    ));
+    Some(format!("Oog done · {}", details.join(" · ")))
+}
+
+fn bash_exit_code(output: &str) -> Option<u64> {
+    let parsed = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    parsed
+        .get("exit_code")
+        .or_else(|| parsed.get("exitCode"))
+        .and_then(serde_json::Value::as_u64)
 }
 
 fn visible_message_text(message: &ConversationMessage) -> String {
@@ -1446,6 +1575,77 @@ fn format_cost_report(usage: TokenUsage) -> String {
     )
 }
 
+fn estimate_text_tokens(text: &str) -> usize {
+    (text.chars().count() + 3) / 4
+}
+
+fn estimate_message_tokens(message: &ConversationMessage) -> usize {
+    message
+        .blocks
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text } => estimate_text_tokens(text),
+            ContentBlock::ToolUse { name, input, .. } => {
+                estimate_text_tokens(name) + estimate_text_tokens(input)
+            }
+            ContentBlock::ToolResult {
+                tool_name, output, ..
+            } => estimate_text_tokens(tool_name) + estimate_text_tokens(output),
+        })
+        .sum()
+}
+
+fn format_small_report(
+    system_prompt: &[String],
+    session: &Session,
+    usage: &UsageTracker,
+    tool_registry: &GlobalToolRegistry,
+    allowed_tools: Option<&AllowedToolSet>,
+    exposed_tools: &BTreeSet<String>,
+) -> String {
+    let active_tools = filter_tool_specs(tool_registry, allowed_tools, exposed_tools);
+    let schema_tokens = active_tools
+        .iter()
+        .filter_map(|tool| serde_json::to_string(tool).ok())
+        .map(|schema| estimate_text_tokens(&schema))
+        .sum::<usize>();
+    let (history_tokens, tool_result_tokens) =
+        session
+            .messages
+            .iter()
+            .fold((0_usize, 0_usize), |(history, tool_results), message| {
+                let tokens = estimate_message_tokens(message);
+                if message.role == MessageRole::Tool {
+                    (history, tool_results + tokens)
+                } else {
+                    (history + tokens, tool_results)
+                }
+            });
+    let system_tokens = system_prompt
+        .iter()
+        .map(|section| estimate_text_tokens(section))
+        .sum::<usize>();
+    let latest = usage.current_turn_usage();
+    let cumulative = usage.cumulative_usage();
+    let active_names = active_tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "Small\n  Active tools     {}\n  Tool names       {active_names}\n\nProvider tokens (reported)\n  Latest input     {}\n  Latest output    {}\n  Latest cache in  {}\n  Latest cache out {}\n  Session input    {}\n  Session output   {}\n\nNext request (local estimate)\n  System prompt    ~{system_tokens}\n  Tool schemas     ~{schema_tokens}\n  History          ~{history_tokens}\n  Tool results     ~{tool_result_tokens}\n  Total            ~{}\n\nEstimates use text length; provider token counts above are authoritative.",
+        active_tools.len(),
+        latest.input_tokens,
+        latest.output_tokens,
+        latest.cache_read_input_tokens,
+        latest.cache_creation_input_tokens,
+        cumulative.input_tokens,
+        cumulative.output_tokens,
+        system_tokens + schema_tokens + history_tokens + tool_result_tokens,
+    )
+}
+
 fn format_resume_report(session_path: &str, message_count: usize, turns: u32) -> String {
     format!(
         "Session resumed
@@ -1770,6 +1970,7 @@ fn run_resume_command(
         | SlashCommand::Resume { .. }
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
+        | SlashCommand::Small
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
         | SlashCommand::Doctor
@@ -1867,7 +2068,6 @@ fn run_repl(
         slash_command_completion_candidates_with_sessions(&model, Some(&cli.session.id), vec![]);
 
     let mut editor = LineEditor::new(render_input_prompt(), completion_candidates);
-    editor.set_footer(render_input_footer(&model, permission_mode));
 
     let (request_tx, request_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
@@ -1900,7 +2100,7 @@ fn run_repl(
     });
 
     println!(
-        "{}Type /help for commands. Ctrl+C or /exit to quit.\x1b[0m",
+        "{}Type /help for commands. Ctrl+C or /quit to quit.\x1b[0m",
         theme_primary_ansi()
     );
 
@@ -2008,6 +2208,8 @@ struct BuiltRuntime {
     plugins_active: bool,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     mcp_active: bool,
+    tool_registry: GlobalToolRegistry,
+    exposed_tools: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl BuiltRuntime {
@@ -2015,6 +2217,8 @@ impl BuiltRuntime {
         runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
         plugin_registry: PluginRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+        tool_registry: GlobalToolRegistry,
+        exposed_tools: Arc<Mutex<BTreeSet<String>>>,
     ) -> Self {
         Self {
             runtime: Some(runtime),
@@ -2022,7 +2226,16 @@ impl BuiltRuntime {
             plugins_active: true,
             mcp_state,
             mcp_active: true,
+            tool_registry,
+            exposed_tools,
         }
+    }
+
+    fn active_tools(&self) -> BTreeSet<String> {
+        self.exposed_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn with_hook_abort_signal(mut self, hook_abort_signal: runtime::HookAbortSignal) -> Self {
@@ -2453,19 +2666,6 @@ impl LiveCli {
             |_| "<unknown>".to_string(),
             |path| path.display().to_string(),
         );
-        let status = status_context(None).ok();
-        let git_branch = status
-            .as_ref()
-            .and_then(|context| context.git_branch.as_deref())
-            .unwrap_or("unknown");
-        let workspace = status.as_ref().map_or_else(
-            || "unknown".to_string(),
-            |context| context.git_summary.headline(),
-        );
-        let session_path = self.session.path.strip_prefix(Path::new(&cwd)).map_or_else(
-            |_| self.session.path.display().to_string(),
-            |path| path.display().to_string(),
-        );
 
         // Get theme colors with proper capability detection
         let theme = Theme::new(ThemePreset::Default);
@@ -2537,16 +2737,12 @@ impl LiveCli {
 
         // Metadata rows with colored bullets (no box)
         let cwd_string = cwd;
-        let workspace_string = workspace;
-        let branch_string = git_branch.to_string();
         let model_string = self.model.clone();
         let permissions_string = self.permission_mode.as_str().to_string();
 
-        let metadata: [(&str, &String); 5] = [
+        let metadata: [(&str, &String); 3] = [
             ("Model", &model_string),
             ("Permissions", &permissions_string),
-            ("Branch", &branch_string),
-            ("Workspace", &workspace_string),
             ("Directory", &cwd_string),
         ];
 
@@ -2587,7 +2783,7 @@ impl LiveCli {
         banner.push('\n');
 
         // Tip section (no box, just the tip text)
-        let tip = tips::random_tip_with_label();
+        let tip = "Ask Oog to build, fix, or explain something.";
         let tip_lines: Vec<&str> = tip.lines().collect();
         if !tip_lines.is_empty() {
             // Replace 💡 with 🙏 in tip
@@ -2604,7 +2800,7 @@ impl LiveCli {
         banner.push('\n');
 
         // Recent activity section (no box)
-        let activity_text = "Recent activity: No recent activity";
+        let activity_text = "Saved chats: /session";
         banner.push_str("  ");
         banner.push_str(&muted_ansi);
         banner.push_str(activity_text);
@@ -2673,6 +2869,13 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 writeln!(stdout)?;
+
+                if let Some(result) =
+                    format_turn_result(&summary, turn_started.elapsed(), &self.model)
+                {
+                    println!("{result}");
+                    println!();
+                }
 
                 if let Some(event) = summary.auto_compaction {
                     println!(
@@ -2797,6 +3000,10 @@ impl LiveCli {
             SlashCommand::Clear { confirm } => self.clear_session(confirm)?,
             SlashCommand::Cost => {
                 self.print_cost();
+                false
+            }
+            SlashCommand::Small => {
+                self.print_small();
                 false
             }
             SlashCommand::Resume { session_path } => self.resume_session(session_path)?,
@@ -3124,6 +3331,21 @@ impl LiveCli {
     fn print_cost(&self) {
         let cumulative = self.runtime.usage().cumulative_usage();
         println!("{}", format_cost_report(cumulative));
+    }
+
+    fn print_small(&self) {
+        let active_tools = self.runtime.active_tools();
+        println!(
+            "{}",
+            format_small_report(
+                &self.system_prompt,
+                self.runtime.session(),
+                self.runtime.usage(),
+                &self.runtime.tool_registry,
+                self.allowed_tools.as_ref(),
+                &active_tools,
+            )
+        );
     }
 
     fn resume_session(
@@ -3548,6 +3770,10 @@ fn resolve_managed_session_handle(
 
 fn delete_managed_session(handle: &SessionHandle) -> Result<(), Box<dyn std::error::Error>> {
     fs::remove_file(&handle.path)?;
+    let tool_output_path = handle.path.with_extension("tool-output");
+    if tool_output_path.exists() {
+        fs::remove_dir_all(tool_output_path)?;
+    }
     let title_path = session_title_path(&handle.path);
     if title_path.exists() {
         fs::remove_file(title_path)?;
@@ -3728,6 +3954,8 @@ fn select_managed_session(
 
     let selection = (|| -> Result<Option<String>, Box<dyn std::error::Error>> {
         loop {
+            let (_, terminal_rows) = terminal::size()?;
+            let visible_sessions = session_picker_visible_count(terminal_rows);
             execute!(
                 stdout,
                 cursor::MoveTo(0, 0),
@@ -3736,7 +3964,7 @@ fn select_managed_session(
             write!(
                 stdout,
                 "{}",
-                render_session_picker(&sessions, selected, confirming_delete)
+                render_session_picker(&sessions, selected, confirming_delete, visible_sessions)
             )?;
             stdout.flush()?;
 
@@ -3762,12 +3990,20 @@ fn select_managed_session(
                     {
                         confirming_delete = true;
                     }
-                    event::KeyCode::Up if !confirming_delete => {
+                    event::KeyCode::Up | event::KeyCode::Char('k') if !confirming_delete => {
                         selected = selected.saturating_sub(1);
                     }
-                    event::KeyCode::Down if !confirming_delete => {
+                    event::KeyCode::Down | event::KeyCode::Char('j') if !confirming_delete => {
                         selected = (selected + 1).min(sessions.len() - 1);
                     }
+                    event::KeyCode::PageUp if !confirming_delete => {
+                        selected = selected.saturating_sub(visible_sessions);
+                    }
+                    event::KeyCode::PageDown if !confirming_delete => {
+                        selected = (selected + visible_sessions).min(sessions.len() - 1);
+                    }
+                    event::KeyCode::Home if !confirming_delete => selected = 0,
+                    event::KeyCode::End if !confirming_delete => selected = sessions.len() - 1,
                     event::KeyCode::Enter if !confirming_delete => {
                         return Ok(Some(sessions[selected].id.clone()));
                     }
@@ -3788,6 +4024,7 @@ fn render_session_picker(
     sessions: &[ManagedSessionSummary],
     selected: usize,
     confirming_delete: bool,
+    visible_sessions: usize,
 ) -> String {
     let mut lines = vec![
         "Saved chats".to_string(),
@@ -3799,7 +4036,15 @@ fn render_session_picker(
     } else {
         "Use ↑/↓ to select · Enter to open · D to delete · Esc to cancel".to_string()
     };
-    for (index, session) in sessions.iter().enumerate() {
+    let (start, end) = session_picker_window(selected, sessions.len(), visible_sessions);
+    let current = if sessions.is_empty() {
+        0
+    } else {
+        selected.saturating_add(1)
+    };
+    lines[0] = format!("Saved chats ({current}/{})", sessions.len());
+    for (index, session) in sessions[start..end].iter().enumerate() {
+        let index = start + index;
         let marker = if index == selected { "›" } else { " " };
         let title = session.title.as_deref().unwrap_or("Untitled chat");
         lines.push(format!("{marker} {title}"));
@@ -3812,7 +4057,34 @@ fn render_session_picker(
         lines.push(format!("    {}", session.id));
         lines.push(String::new());
     }
+    if sessions.len() > visible_sessions {
+        lines.push(format!(
+            "Showing {}–{} of {} chats",
+            start + 1,
+            end,
+            sessions.len()
+        ));
+    }
     lines.join("\n")
+}
+
+fn session_picker_visible_count(terminal_rows: u16) -> usize {
+    usize::from(terminal_rows.saturating_sub(5) / 4).clamp(1, 7)
+}
+
+fn session_picker_window(
+    selected: usize,
+    session_count: usize,
+    visible_sessions: usize,
+) -> (usize, usize) {
+    if session_count == 0 {
+        return (0, 0);
+    }
+    let visible = visible_sessions.clamp(1, session_count);
+    let start = selected
+        .saturating_sub(visible / 2)
+        .min(session_count.saturating_sub(visible));
+    (start, start + visible)
 }
 
 fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -3896,57 +4168,42 @@ fn session_clear_backup_path(session_path: &Path) -> PathBuf {
 
 fn render_repl_help() -> String {
     [
-        "REPL".to_string(),
-        "  /exit                Quit the REPL".to_string(),
-        "  /quit                Quit the REPL".to_string(),
-        "  Up/Down              Navigate prompt history".to_string(),
-        "  Tab                  Complete commands, modes, and recent sessions".to_string(),
-        "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
-        "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
-        "  Auto-save            .minseo/sessions/<session-id>.jsonl".to_string(),
-        "  Resume latest        /resume latest".to_string(),
-        "  Browse sessions      /session list".to_string(),
+        "Oog controls".to_string(),
+        "  /see                 Session, workspace, and active context".to_string(),
+        "  /smash               Compact chat history".to_string(),
+        "  /small               Token and context ledger".to_string(),
+        "  /session             Open saved chats".to_string(),
+        "  /clear --confirm     Start a fresh chat".to_string(),
+        "  /cost                Provider token usage and cost".to_string(),
+        "  /help                Show this guide".to_string(),
+        "  /quit                Exit Oog".to_string(),
         String::new(),
-        render_live_slash_command_help(),
+        "Advanced controls".to_string(),
+        "  /model [model]       Inspect or switch model".to_string(),
+        "  /permissions [mode]  Inspect or switch permission mode".to_string(),
+        String::new(),
+        "Keys".to_string(),
+        "  Up/Down              Prompt history".to_string(),
+        "  Tab                  Complete commands and saved chats".to_string(),
+        "  Ctrl-C               Clear input (or exit when empty)".to_string(),
+        "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
     ]
-    .join(
-        "
-",
-    )
+    .join("\n")
 }
 
 fn is_live_slash_command(name: &str) -> bool {
     matches!(
         name,
         "help"
-            | "status"
-            | "sandbox"
-            | "compact"
+            | "see"
+            | "smash"
+            | "small"
             | "model"
             | "permissions"
             | "clear"
             | "cost"
-            | "resume"
-            | "config"
-            | "mcp"
-            | "memory"
-            | "init"
-            | "diff"
-            | "version"
-            | "bughunter"
-            | "commit"
-            | "pr"
-            | "issue"
-            | "ultraplan"
-            | "teleport"
-            | "debug-tool-call"
-            | "export"
             | "session"
-            | "plugin"
-            | "agents"
-            | "skills"
-            | "shortcuts"
-            | "exit"
+            | "quit"
     )
 }
 
@@ -5158,7 +5415,7 @@ fn describe_tool_progress(name: &str, input: &str) -> String {
     let parsed: serde_json::Value =
         serde_json::from_str(input).unwrap_or(serde_json::Value::String(input.to_string()));
     match name {
-        "bash" | "Bash" => {
+        "bash" | "Bash" | "PowerShell" => {
             let command = parsed
                 .get("command")
                 .and_then(|value| value.as_str())
@@ -5281,7 +5538,7 @@ fn build_runtime_with_plugin_state(
             emit_output,
             tool_registry.clone(),
             mcp_state.clone(),
-            exposed_tools,
+            Arc::clone(&exposed_tools),
         ),
         policy,
         system_prompt,
@@ -5290,7 +5547,13 @@ fn build_runtime_with_plugin_state(
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
-    Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
+    Ok(BuiltRuntime::new(
+        runtime,
+        plugin_registry,
+        mcp_state,
+        tool_registry,
+        exposed_tools,
+    ))
 }
 
 struct CliHookProgressReporter;
@@ -5469,7 +5732,7 @@ impl ApiClient for AnthropicRuntimeClient {
             let mut events = Vec::new();
             let mut pending_tool: Option<(String, String, String)> = None;
             let mut saw_stop = false;
-            let mut assistant_at_line_start = self.emit_output;
+            let mut assistant_trailing_newlines = 0;
 
             while let Some(event) = stream
                 .next_event()
@@ -5500,7 +5763,7 @@ impl ApiClient for AnthropicRuntimeClient {
                                 if let Some(rendered) = markdown_stream.push(&renderer, &text) {
                                     let rendered = indent_output_chunk(
                                         &rendered,
-                                        &mut assistant_at_line_start,
+                                        &mut assistant_trailing_newlines,
                                     );
                                     if self.emit_output {
                                         with_terminal_output(|out| {
@@ -5530,7 +5793,7 @@ impl ApiClient for AnthropicRuntimeClient {
                     ApiStreamEvent::ContentBlockStop(_) => {
                         if let Some(rendered) = markdown_stream.flush(&renderer) {
                             let rendered =
-                                indent_output_chunk(&rendered, &mut assistant_at_line_start);
+                                indent_output_chunk(&rendered, &mut assistant_trailing_newlines);
                             if self.emit_output {
                                 with_terminal_output(|out| {
                                     write!(out, "{rendered}")?;
@@ -5548,9 +5811,9 @@ impl ApiClient for AnthropicRuntimeClient {
                                 progress_reporter.mark_tool_phase(&name, &input);
                             }
                             // Display tool call now that input is fully accumulated
-                            let rendered = indent_output_chunk(
-                                &format!("\n{}\n", format_tool_call_start(&name, &input)),
-                                &mut assistant_at_line_start,
+                            let rendered = render_section_start(
+                                &format_tool_call_start(&name, &input),
+                                &mut assistant_trailing_newlines,
                             );
                             if self.emit_output {
                                 with_terminal_output(|out| {
@@ -5573,7 +5836,7 @@ impl ApiClient for AnthropicRuntimeClient {
                         saw_stop = true;
                         if let Some(rendered) = markdown_stream.flush(&renderer) {
                             let rendered =
-                                indent_output_chunk(&rendered, &mut assistant_at_line_start);
+                                indent_output_chunk(&rendered, &mut assistant_trailing_newlines);
                             write!(out, "{rendered}")
                                 .and_then(|()| out.flush())
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -5781,19 +6044,19 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
                 .get("command")
                 .and_then(|value| value.as_str())
                 .unwrap_or("shell command");
-            format!("Running {}", truncate_for_summary(command, 100))
+            format!("bonk: {}", truncate_for_summary(command, 100))
         }
         "read_file" | "Read" => {
             let path = extract_tool_path(&parsed);
-            format!("Reading {path}")
+            format!("look: {path}")
         }
         "write_file" | "Write" => {
             let path = extract_tool_path(&parsed);
-            format!("Writing {path}")
+            format!("carve: {path}")
         }
         "edit_file" | "Edit" => {
             let path = extract_tool_path(&parsed);
-            format!("Updating {path}")
+            format!("carve: {path}")
         }
         "glob_search" | "Glob" | "grep_search" | "Grep" => {
             let pattern = parsed
@@ -5804,46 +6067,60 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
                 .get("path")
                 .and_then(|value| value.as_str())
                 .unwrap_or(".");
-            format!("Searching {pattern} in {path}")
+            format!("sniff: {pattern} @ {path}")
         }
         "web_search" | "WebSearch" => format!(
-            "Searching the web for {}",
+            "sniff web: {}",
             parsed
                 .get("query")
                 .and_then(|value| value.as_str())
                 .unwrap_or("?")
         ),
-        _ => format!("Running {name}"),
+        "ToolSearch" => format!(
+            "sniff tools: {}",
+            parsed
+                .get("query")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?")
+        ),
+        _ if parsed.get("command").is_some() => {
+            let command = parsed
+                .get("command")
+                .and_then(|value| value.as_str())
+                .unwrap_or("shell command");
+            format!("bonk: {}", truncate_for_summary(command, 100))
+        }
+        _ => format!("work: {name}"),
     };
 
-    format!("\x1b[2m• {detail}\x1b[0m")
+    format!("Oog {detail}")
 }
 
 fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
     let icon = if is_error {
-        "\x1b[1;31m\u{2717}\x1b[0m"
+        format!("{}x{}", theme_error_ansi(), "\x1b[0m")
     } else {
-        "\x1b[1;32m\u{2713}\x1b[0m"
+        format!("{}ok{}", theme_success_ansi(), "\x1b[0m")
     };
     if is_error {
         let summary = truncate_for_summary(output.trim(), 160);
         return if summary.is_empty() {
             format!("{icon} {name}")
         } else {
-            format!("{icon} {name}: \x1b[38;5;203m{summary}\x1b[0m")
+            format!("{icon} {name}: {}{summary}\x1b[0m", theme_error_ansi())
         };
     }
 
     let parsed: serde_json::Value =
         serde_json::from_str(output).unwrap_or(serde_json::Value::String(output.to_string()));
     match name {
-        "bash" | "Bash" => format_bash_result(icon, &parsed),
-        "read_file" | "Read" => format_read_result(icon, &parsed),
-        "write_file" | "Write" => format_write_result(icon, &parsed),
-        "edit_file" | "Edit" => format_edit_result(icon, &parsed),
-        "glob_search" | "Glob" => format_glob_result(icon, &parsed),
-        "grep_search" | "Grep" => format_grep_result(icon, &parsed),
-        _ => format_generic_tool_result(icon, name, &parsed),
+        "bash" | "Bash" | "PowerShell" => format_shell_result(&icon, name, &parsed),
+        "read_file" | "Read" => format_read_result(&icon, &parsed),
+        "write_file" | "Write" => format_write_result(&icon, &parsed),
+        "edit_file" | "Edit" => format_edit_result(&icon, &parsed),
+        "glob_search" | "Glob" => format_glob_result(&icon, &parsed),
+        "grep_search" | "Grep" => format_grep_result(&icon, &parsed),
+        _ => format_generic_tool_result(&icon, name, &parsed),
     }
 }
 
@@ -5863,13 +6140,13 @@ fn first_visible_line(text: &str) -> &str {
         .unwrap_or(text)
 }
 
-fn format_bash_result(icon: &str, parsed: &serde_json::Value) -> String {
+fn format_shell_result(icon: &str, name: &str, parsed: &serde_json::Value) -> String {
     let exit_code = parsed
         .get("exit_code")
         .or_else(|| parsed.get("exitCode"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    format!("{icon} Command finished (exit code {exit_code})")
+    format!("{icon} {name} finished (exit code {exit_code})")
 }
 
 fn format_read_result(icon: &str, parsed: &serde_json::Value) -> String {
@@ -6401,25 +6678,26 @@ mod tests {
     use super::{
         auto_session_title, build_runtime_plugin_state_with_loader,
         build_runtime_with_plugin_state, create_managed_session_handle, default_tool_profile,
-        describe_tool_progress, detect_project_stack, ensure_session_title, filter_tool_specs,
-        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
-        format_compact_report, format_cost_report, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, normalize_permission_mode, normalize_session_title,
-        parse_args as parse_cli_args, parse_git_status_branch, parse_git_status_metadata_for,
-        parse_git_workspace_summary, permission_policy, print_help_to, push_output_block,
-        read_session_title, render_config_report, render_diff_report, render_diff_report_for,
-        render_memory_report, render_repl_help, render_resume_usage, render_session_picker,
+        delete_managed_session, describe_tool_progress, detect_project_stack, ensure_session_title,
+        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
+        format_commit_skipped_report, format_compact_report, format_cost_report,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_small_report, format_status_report,
+        format_tool_call_start, format_tool_result, format_turn_result, format_ultraplan_report,
+        format_unknown_slash_command, format_unknown_slash_command_message,
+        normalize_permission_mode, normalize_session_title, parse_args as parse_cli_args,
+        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
+        permission_policy, print_help_to, push_output_block, read_session_title,
+        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
+        render_repl_help, render_resume_usage, render_section_start, render_session_picker,
         resolve_model_alias, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command, session_preview,
-        slash_command_completion_candidates_with_sessions, status_context, suggest_slash_commands,
-        validate_no_args, visible_message_text, write_mcp_server_fixture, write_session_title,
-        CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+        resume_supported_slash_commands, run_resume_command, session_picker_window,
+        session_preview, slash_command_completion_candidates_with_sessions, status_context,
+        suggest_slash_commands, validate_no_args, visible_message_text, write_mcp_server_fixture,
+        write_session_title, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, ManagedSessionSummary,
-        SlashCommand, StatusUsage, CORE_TOOL_NAMES, DEFAULT_MODEL,
+        SessionHandle, SlashCommand, StatusUsage, CORE_TOOL_NAMES, DEFAULT_MODEL,
     };
     use api::{MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -6427,13 +6705,13 @@ mod tests {
     };
     use runtime::{
         AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, MessageRole,
-        PermissionMode, Session, ToolExecutor,
+        PermissionMode, Session, TokenUsage, ToolExecutor, UsageTracker,
     };
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
 
@@ -7104,6 +7382,69 @@ mod tests {
     }
 
     #[test]
+    fn small_report_separates_provider_tokens_from_local_estimates() {
+        let mut session = Session::new();
+        session
+            .messages
+            .push(ConversationMessage::assistant_with_usage(
+                vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                }],
+                Some(TokenUsage {
+                    input_tokens: 120,
+                    output_tokens: 8,
+                    cache_creation_input_tokens: 3,
+                    cache_read_input_tokens: 5,
+                }),
+            ));
+        session.messages.push(ConversationMessage::tool_result(
+            "tool-1",
+            "bash",
+            "line one\nline two",
+            false,
+        ));
+        let exposed = default_tool_profile(None);
+        let report = format_small_report(
+            &["Oog stays concise.".to_string()],
+            &session,
+            &UsageTracker::from_session(&session),
+            &GlobalToolRegistry::builtin(),
+            None,
+            &exposed,
+        );
+
+        assert!(report.contains("Active tools     6"));
+        assert!(report.contains("Latest input     120"));
+        assert!(report.contains("Latest output    8"));
+        assert!(report.contains("Latest cache in  5"));
+        assert!(report.contains("System prompt    ~"));
+        assert!(report.contains("Tool schemas     ~"));
+        assert!(report.contains("Tool results     ~"));
+        assert!(report.contains("authoritative"));
+    }
+
+    #[test]
+    fn tool_search_exposes_discovered_tools_for_the_next_request() {
+        let exposed_tools = Arc::new(Mutex::new(default_tool_profile(None)));
+        let mut executor = CliToolExecutor::new(
+            None,
+            false,
+            GlobalToolRegistry::builtin(),
+            None,
+            Arc::clone(&exposed_tools),
+        );
+
+        executor
+            .execute("ToolSearch", r#"{"query":"web current"}"#)
+            .expect("tool search should succeed");
+
+        assert!(exposed_tools
+            .lock()
+            .expect("exposure state should not be poisoned")
+            .contains("WebSearch"));
+    }
+
+    #[test]
     fn permission_policy_uses_plugin_tool_permissions() {
         let feature_config = runtime::RuntimeFeatureConfig::default();
         let policy = permission_policy(
@@ -7124,37 +7465,20 @@ mod tests {
     }
 
     #[test]
-    fn repl_help_includes_shared_commands_and_exit() {
+    fn repl_help_lists_the_compact_oog_control_surface() {
         let help = render_repl_help();
-        assert!(help.contains("REPL"));
+        assert!(help.contains("Oog controls"));
         assert!(help.contains("/help"));
-        assert!(help.contains("Complete commands, modes, and recent sessions"));
-        assert!(help.contains("/status"));
-        assert!(help.contains("/sandbox"));
+        assert!(help.contains("/see"));
+        assert!(help.contains("/smash"));
+        assert!(help.contains("/small"));
+        assert!(help.contains("/session"));
         assert!(help.contains("/model [model]"));
-        assert!(help.contains("/permissions [read-only|workspace-write|danger-full-access]"));
-        assert!(help.contains("/clear [--confirm]"));
+        assert!(help.contains("/permissions [mode]"));
+        assert!(help.contains("/clear --confirm"));
         assert!(help.contains("/cost"));
-        assert!(help.contains("/resume <session-path>"));
-        assert!(help.contains("/config [env|hooks|model|plugins]"));
-        assert!(help.contains("/mcp [list|show <server>|help]"));
-        assert!(help.contains("/memory"));
-        assert!(help.contains("/init"));
-        assert!(help.contains("/diff"));
-        assert!(help.contains("/version"));
-        assert!(help.contains("/export [file]"));
-        assert!(
-            help.contains("/session [list|rename <title>|switch <session-id>|fork [branch-name]|delete <session-id> --confirm]")
-        );
-        assert!(help.contains(
-            "/plugin [list|install <path>|enable <name>|disable <name>|uninstall <id>|update <id>]"
-        ));
-        assert!(help.contains("aliases: /plugins, /marketplace"));
-        assert!(help.contains("/agents"));
-        assert!(help.contains("/skills"));
-        assert!(help.contains("/exit"));
-        assert!(help.contains("Auto-save            .minseo/sessions/<session-id>.jsonl"));
-        assert!(help.contains("Resume latest        /resume latest"));
+        assert!(help.contains("/quit"));
+        assert!(!help.contains("/bughunter"));
     }
 
     #[test]
@@ -7175,7 +7499,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_banner_mentions_workflow_completions() {
+    fn startup_banner_keeps_only_useful_oog_context() {
         let _guard = env_lock();
         // Inject dummy credentials so LiveCli can construct without real Anthropic key
         std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-banner-test");
@@ -7196,6 +7520,12 @@ mod tests {
         assert!(!banner.trim().is_empty());
         assert!(banner.contains("___    ___    ____"));
         assert!(banner.contains("carve less. ship more."));
+        assert!(banner.contains("Ask Oog to build, fix, or explain something."));
+        assert!(banner.contains("Saved chats: /session"));
+        assert!(banner.contains("Model:"));
+        assert!(banner.contains("Permissions:"));
+        assert!(banner.contains("Directory:"));
+        assert!(!banner.contains("Recent activity:"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -7215,8 +7545,8 @@ mod tests {
         );
         // Verify key resume commands still exist
         assert!(names.contains(&"help"));
-        assert!(names.contains(&"status"));
-        assert!(names.contains(&"compact"));
+        assert!(names.contains(&"see"));
+        assert!(names.contains(&"smash"));
     }
 
     #[test]
@@ -7451,6 +7781,7 @@ mod tests {
             }],
             0,
             false,
+            5,
         );
         assert!(picker.contains("› Fix login"));
         assert!(picker.contains("Enter to open"));
@@ -7458,8 +7789,36 @@ mod tests {
 
     #[test]
     fn session_picker_shows_delete_confirmation() {
-        let picker = render_session_picker(&[], 0, true);
+        let picker = render_session_picker(&[], 0, true, 5);
         assert!(picker.contains("Delete selected chat? Y to confirm"));
+    }
+
+    #[test]
+    fn session_picker_window_scrolls_to_keep_selection_visible() {
+        assert_eq!(session_picker_window(0, 12, 5), (0, 5));
+        assert_eq!(session_picker_window(7, 12, 5), (5, 10));
+        assert_eq!(session_picker_window(11, 12, 5), (7, 12));
+    }
+
+    #[test]
+    fn deleting_session_removes_its_saved_tool_output() {
+        let directory = temp_dir();
+        fs::create_dir_all(&directory).expect("session directory should exist");
+        let handle = SessionHandle {
+            id: "session-1".to_string(),
+            path: directory.join("session-1.jsonl"),
+        };
+        fs::write(&handle.path, "{}\n").expect("session should exist");
+        let artifact = handle.path.with_extension("tool-output").join("tool-1.txt");
+        fs::create_dir_all(artifact.parent().expect("artifact parent"))
+            .expect("artifact directory should exist");
+        fs::write(&artifact, "full command output").expect("artifact should exist");
+
+        delete_managed_session(&handle).expect("session should delete");
+
+        assert!(!handle.path.exists());
+        assert!(!artifact.exists());
+        fs::remove_dir_all(directory).expect("cleanup test directory");
     }
 
     #[test]
@@ -7927,8 +8286,13 @@ UU conflicted.rs",
     #[test]
     fn tool_rendering_helpers_compact_output() {
         let start = format_tool_call_start("read_file", r#"{"path":"src/main.rs"}"#);
-        assert!(start.contains("Reading"));
+        assert!(start.contains("Oog look:"));
+        assert!(start.contains("look:"));
         assert!(start.contains("src/main.rs"));
+        assert!(
+            format_tool_call_start("PowerShell", r#"{"command":"Get-ChildItem"}"#)
+                .contains("Oog bonk: Get-ChildItem")
+        );
 
         let done = format_tool_result(
             "read_file",
@@ -7941,6 +8305,74 @@ UU conflicted.rs",
         let failed = format_tool_result("read_file", "permission denied", true);
         assert!(failed.contains("permission denied"));
         assert!(!failed.contains('\n'));
+    }
+
+    #[test]
+    fn tool_sections_keep_one_blank_line_between_output_and_rule() {
+        let mut trailing_newlines = 0;
+        let first = render_section_start("Oog look: src/main.rs", &mut trailing_newlines);
+        assert!(first.starts_with("\n\n"));
+        assert!(first.contains("Oog look: src/main.rs"));
+
+        let second = render_section_start("Oog bonk: cargo test", &mut trailing_newlines);
+        assert!(second.starts_with('\n'));
+        assert!(!second.starts_with("\n\n"));
+    }
+
+    #[test]
+    fn turn_result_reports_files_tests_time_and_usage() {
+        let summary = runtime::TurnSummary {
+            assistant_messages: vec![ConversationMessage::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "edit".to_string(),
+                    name: "edit_file".to_string(),
+                    input: r#"{"path":"src/lib.rs"}"#.to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "test".to_string(),
+                    name: "bash".to_string(),
+                    input: r#"{"command":"cargo test"}"#.to_string(),
+                },
+            ])],
+            tool_results: vec![ConversationMessage::tool_result(
+                "test",
+                "bash",
+                r#"{"exit_code":0}"#,
+                false,
+            )],
+            prompt_cache_events: Vec::new(),
+            iterations: 2,
+            usage: runtime::TokenUsage {
+                input_tokens: 12,
+                output_tokens: 4,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+            auto_compaction: None,
+        };
+
+        let result = format_turn_result(&summary, Duration::from_secs(2), "claude-sonnet")
+            .expect("tool turn should have a result");
+        assert!(result.contains("Oog done · 2 tools"));
+        assert!(result.contains("carved src/lib.rs"));
+        assert!(result.contains("tests passed"));
+        assert!(result.contains("2s"));
+        assert!(result.contains("12 in / 4 out"));
+
+        let failed_summary = runtime::TurnSummary {
+            tool_results: vec![ConversationMessage::tool_result(
+                "test",
+                "bash",
+                r#"{"exitCode":1}"#,
+                false,
+            )],
+            ..summary
+        };
+        assert!(
+            format_turn_result(&failed_summary, Duration::from_secs(2), "claude-sonnet")
+                .expect("tool turn should have a result")
+                .contains("tests failed")
+        );
     }
 
     #[test]

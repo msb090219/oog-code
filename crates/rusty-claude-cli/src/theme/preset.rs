@@ -186,14 +186,14 @@ impl ThemePreset {
                 Color::Rgb { r, g, b } => {
                     // Simple RGB to ANSI conversion
                     // Find the strongest channel first, then check for bright colors
-                    if b >= 120 && r >= 60 && r > g {
-                        Color::Magenta
-                    } else if r.abs_diff(g) < 25 && g.abs_diff(b) < 25 {
+                    if r.abs_diff(g) < 25 && g.abs_diff(b) < 25 {
                         if r >= 160 {
                             Color::White
                         } else {
                             Color::Grey
                         }
+                    } else if b >= 120 && r >= 60 && r > g {
+                        Color::Magenta
                     } else if r >= 150 && g >= 100 && b < 120 {
                         Color::Yellow
                     } else if b >= g && b >= r {
@@ -272,6 +272,12 @@ mod tests {
             Color::Green => {}
             _ => panic!("Expected green for success in ANSI mode"),
         }
+    }
+
+    #[test]
+    fn ansi_uses_white_for_bone() {
+        let colors = ThemePreset::Default.degrade_for_capability(&TerminalCapability::Ansi);
+        assert_eq!(colors.secondary, Color::White);
     }
 
     #[test]

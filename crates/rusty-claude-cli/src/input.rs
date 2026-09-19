@@ -409,7 +409,7 @@ impl LineEditor {
 
         // Return to the start of the editable line before clearing and
         // repainting. Clearing from the previous cursor position leaves the
-        // old prompt in place and duplicates `oog> ` on every keystroke.
+        // old prompt in place and duplicates the prompt on every keystroke.
         crossterm::queue!(
             stdout,
             cursor::MoveToColumn(0),
@@ -469,7 +469,7 @@ impl LineEditor {
         }
 
         // Move cursor back to the end of the editable prompt. The prompt is
-        // intentionally plain (`oog> `); using its actual width avoids the
+        // intentionally plain; using its actual width avoids the
         // repeated-character corruption caused by the old hard-coded column.
         let prompt_width = self.prompt.chars().count() as u16;
         if rows_below > 0 {

@@ -14,6 +14,11 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 
+const CODE_BLOCK_BACKGROUND: &str = "\x1b[48;2;30;34;38m";
+const CODE_BLOCK_HEADER: &str = "\x1b[48;2;36;41;45m";
+const CODE_BLOCK_LABEL: &str = "\x1b[38;2;215;168;62m";
+const CODE_BLOCK_TEXT: &str = "\x1b[38;2;232;225;207m";
+
 /// Color theme using semantic tokens from the theme system
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColorTheme {
@@ -263,30 +268,6 @@ impl RenderState {
         self.append_raw(output, &styled);
     }
 
-    fn should_insert_divider(
-        &self,
-        current_block_type: BlockType,
-        heading_level: Option<u8>,
-    ) -> bool {
-        match self.previous_block_type {
-            None => false,
-            Some(previous) => {
-                // Never around code blocks
-                if matches!(previous, BlockType::CodeBlock)
-                    || matches!(current_block_type, BlockType::CodeBlock)
-                {
-                    return false;
-                }
-                // Only before H1/H2 headings
-                if matches!(current_block_type, BlockType::Heading) {
-                    return matches!(heading_level, Some(1 | 2));
-                }
-                // No dividers elsewhere
-                false
-            }
-        }
-    }
-
     fn update_block_type(&mut self, block_type: BlockType) {
         self.previous_block_type = Some(block_type);
     }
@@ -323,13 +304,6 @@ impl TerminalRenderer {
     #[must_use]
     pub fn color_theme(&self) -> &ColorTheme {
         &self.color_theme
-    }
-
-    fn render_divider(&self, output: &mut String) {
-        let divider = "─".repeat(80);
-        let styled = format!("{}", divider.with(self.color_theme.emphasis));
-        output.push_str(&styled);
-        output.push('\n');
     }
 
     #[must_use]
@@ -371,9 +345,6 @@ impl TerminalRenderer {
     ) {
         match event {
             Event::Start(Tag::Heading { level, .. }) => {
-                if state.should_insert_divider(BlockType::Heading, Some(level as u8)) {
-                    self.render_divider(output);
-                }
                 Self::start_heading(state, level as u8, output);
                 state.update_block_type(BlockType::Heading);
             }
@@ -382,9 +353,6 @@ impl TerminalRenderer {
                 output.push_str("\n\n");
             }
             Event::Start(Tag::BlockQuote(..)) => {
-                if state.should_insert_divider(BlockType::BlockQuote, None) {
-                    self.render_divider(output);
-                }
                 self.start_quote(state, output);
             }
             Event::End(TagEnd::BlockQuote(..)) => {
@@ -400,9 +368,6 @@ impl TerminalRenderer {
                 state.append_raw(output, "\n");
             }
             Event::Start(Tag::List(first_item)) => {
-                if state.should_insert_divider(BlockType::List, None) {
-                    self.render_divider(output);
-                }
                 let kind = match first_item {
                     Some(index) => ListKind::Ordered { next_index: index },
                     None => ListKind::Unordered,
@@ -486,9 +451,6 @@ impl TerminalRenderer {
                 state.append_raw(output, &rendered);
             }
             Event::Start(Tag::Table(..)) => {
-                if state.should_insert_divider(BlockType::Table, None) {
-                    self.render_divider(output);
-                }
                 state.table = Some(TableState::default());
             }
             Event::End(TagEnd::Table) => {
@@ -571,12 +533,16 @@ impl TerminalRenderer {
         if !output.is_empty() && !output.ends_with('\n') {
             output.push('\n');
         }
-        let _ = writeln!(output, "\x1b[48;5;238;38;5;255m {label} \x1b[0m");
+        let _ = writeln!(
+            output,
+            "{CODE_BLOCK_HEADER}{CODE_BLOCK_LABEL} {label} \x1b[0m"
+        );
     }
 
     fn finish_code_block(&self, code_buffer: &str, code_language: &str, output: &mut String) {
         output.push_str(&self.highlight_code(code_buffer, code_language));
-        output.push_str("\x1b[48;5;238m \x1b[0m");
+        output.push_str(CODE_BLOCK_BACKGROUND);
+        output.push_str(" \x1b[0m");
         output.push_str("\n\n");
     }
 
@@ -747,8 +713,8 @@ fn apply_code_block_background(line: &str) -> String {
     } else {
         "\n"
     };
-    let with_background = trimmed.replace("\u{1b}[0m", "\u{1b}[0;48;5;236m");
-    format!("\u{1b}[48;5;236m{with_background}\u{1b}[0m{trailing_newline}")
+    let with_background = trimmed.replace("\u{1b}[0m", "\u{1b}[0;48;2;30;34;38m");
+    format!("{CODE_BLOCK_BACKGROUND}{CODE_BLOCK_TEXT}{with_background}\u{1b}[0m{trailing_newline}")
 }
 
 fn find_stream_safe_boundary(markdown: &str) -> Option<usize> {
@@ -916,6 +882,14 @@ mod tests {
     }
 
     #[test]
+    fn headings_do_not_add_terminal_section_dividers() {
+        let renderer = TerminalRenderer::new();
+        let rendered = strip_ansi(&renderer.render_markdown("Body\n\n# Heading"));
+
+        assert!(!rendered.contains(&"─".repeat(80)));
+    }
+
+    #[test]
     fn renders_links_as_colored_markdown_labels() {
         let terminal_renderer = TerminalRenderer::new();
         let markdown_output =
@@ -936,8 +910,8 @@ mod tests {
         assert!(plain_text.contains("rust"));
         assert!(plain_text.contains("fn hi"));
         assert!(markdown_output.contains('\u{1b}'));
-        assert!(markdown_output.contains("[48;5;238m"));
-        assert!(markdown_output.contains("[48;5;236m"));
+        assert!(markdown_output.contains("[48;2;36;41;45m"));
+        assert!(markdown_output.contains("[48;2;30;34;38m"));
     }
 
     #[test]

@@ -40,6 +40,14 @@ pub fn detect_capability() -> TerminalCapability {
         }
     }
 
+    if cfg!(windows)
+        && (env::var_os("WT_SESSION").is_some()
+            || env::var_os("ConEmuANSI").is_some()
+            || env::var_os("ANSICON").is_some())
+    {
+        return TerminalCapability::TrueColor;
+    }
+
     // Check TERM environment variable
     if let Ok(term) = env::var("TERM") {
         // Check for 24-bit color support

@@ -137,7 +137,7 @@ impl SystemPromptBuilder {
         if let (Some(name), Some(prompt)) = (&self.output_style_name, &self.output_style_prompt) {
             sections.push(format!("# Output Style: {name}\n{prompt}"));
         }
-        sections.push(get_caveman_code_section());
+        sections.push(get_oog_code_section());
         sections.push(get_simple_system_section());
         sections.push(get_simple_doing_tasks_section());
         sections.push(get_actions_section());
@@ -185,12 +185,15 @@ impl SystemPromptBuilder {
     }
 }
 
-fn get_caveman_code_section() -> String {
+fn get_oog_code_section() -> String {
     [
-        "# Caveman Code voice",
-        "Speak as a warm, clever caveman: use simple, playful language while remaining capable and honest.",
-        "Keep greetings brief: one short sentence, then ask what the user wants to do.",
+        "# Oog Code response rules",
+        "Be brief and plain: lead with the result or next action.",
+        "Let the interface carry Oog's personality; write assistant replies in clear, standard English.",
+        "Use a light Oog phrase sparingly when it improves the moment, never broken grammar, roleplay, or decorative emoji.",
+        "Report coding work with concrete evidence: changed files, command or test outcome, and remaining risk.",
         "Keep code, commands, paths, URLs, JSON, diffs, numeric values, permission choices, and error details exact.",
+        "Never compress user prompts, source code, commands, exact errors, security warnings, or destructive-action confirmations.",
         "Before a destructive or externally visible action, state the exact action and approval needed plainly.",
         "Never pretend a tool ran, a test passed, or a change succeeded when it did not.",
     ]
@@ -689,12 +692,16 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_includes_caveman_code_voice_and_safety_contract() {
+    fn system_prompt_includes_oog_rules_and_safety_contract() {
         let prompt = SystemPromptBuilder::new().render();
 
-        assert!(prompt.contains("# Caveman Code voice"));
-        assert!(prompt.contains("warm, clever caveman"));
+        assert!(prompt.contains("# Oog Code response rules"));
+        assert!(prompt.contains("lead with the result or next action"));
+        assert!(prompt.contains("clear, standard English"));
+        assert!(prompt.contains("never broken grammar"));
+        assert!(!prompt.contains("Caveman Code"));
         assert!(prompt.contains("paths, URLs, JSON, diffs"));
+        assert!(prompt.contains("Never compress user prompts, source code"));
         assert!(prompt.contains("Never pretend a tool ran"));
     }
 
